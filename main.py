@@ -1,332 +1,286 @@
 import torch
 import torch.nn as nn
-import torch.nn.utils.prune as prune
-from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForSequenceClassification
+from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForSequenceClassification, DataCollatorWithPadding, TrainerCallback
 from datasets import load_dataset
 import evaluate
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 import logging
+import argparse
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# This callback re-applies the pruning mask after each optimization step
+class PruningCallback(TrainerCallback):
+    def __init__(self, masks):
+        self.masks = masks
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        with torch.no_grad():
+            for name, module in model.named_modules():
+                if isinstance(module, nn.Linear):
+                    param_name = f"{name}.weight"
+                    if param_name in self.masks:
+                        module.weight.data.mul_(self.masks[param_name])
+
+def plot_loss_curves(histories):
+    logger.info("Plotting training loss curves...")
+    plt.figure(figsize=(12, 7))
+
+    cumulative_steps = 0
+    for i, history in enumerate(histories):
+        logs = [log for log in history if 'loss' in log and 'eval_loss' not in log]
+        if logs:
+            steps = [log['step'] + cumulative_steps for log in logs]
+            loss = [log['loss'] for log in logs]
+            plt.plot(steps, loss, label=f'Cycle {i+1} Training', marker='o', linestyle='-')
+            # Ensure cumulative_steps is updated correctly even for single-log histories
+            if steps:
+                cumulative_steps = steps[-1]
+
+    plt.title('Cyclical Training Loss Curves')
+    plt.xlabel('Total Training Steps')
+    plt.ylabel('Loss')
+    if cumulative_steps > 0: # Only show legend if there is data
+        plt.legend()
+    plt.grid(True)
+    plt.savefig("training_loss_curves.png")
+    logger.info("Training loss curves plot saved to training_loss_curves.png")
+    plt.close()
 
 class IterativePruner:
     def __init__(self, model_name, device):
-        """
-        Initializes the Pruner with a model name and device.
-        """
         self.model_name = model_name
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         logger.info(f"Using device: {self.device}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.teacher_model = None
-        self.student_model = None
+        self.model = None
         self.train_dataset = None
         self.eval_dataset = None
         self.metrics = evaluate.combine(["accuracy", "f1"])
+        self.activations = {}
 
-    def load_and_prepare_dataset(self, dataset_name, task, text_fields):
-        """
-        Loads and tokenizes the dataset.
-        """
+    def load_and_prepare_dataset(self, dataset_name, task, text_fields, debug_mode=False):
         logger.info(f"Loading and preparing dataset: {dataset_name} ({task})")
         dataset = load_dataset(dataset_name, task)
 
         def preprocess_function(examples):
-            # The tokenizer will handle padding and truncation.
-            return self.tokenizer(examples[text_fields[0]], examples[text_fields[1]], truncation=True)
+            return self.tokenizer(
+                examples[text_fields[0]], examples[text_fields[1]],
+                truncation=True, padding="max_length", max_length=128
+            )
 
-        tokenized_datasets = dataset.map(preprocess_function, batched=True)
-        self.train_dataset = tokenized_datasets['train']
-        self.eval_dataset = tokenized_datasets['validation']
+        columns_to_remove = [name for name in dataset['train'].column_names if name != 'label']
+        tokenized_datasets = dataset.map(preprocess_function, batched=True, remove_columns=columns_to_remove)
+
+        if debug_mode:
+            logger.info("--- RUNNING IN DEBUG MODE ---")
+            self.train_dataset = tokenized_datasets['train'].select(range(160))
+            self.eval_dataset = tokenized_datasets['validation'].select(range(160))
+        else:
+            self.train_dataset = tokenized_datasets['train']
+            self.eval_dataset = tokenized_datasets['validation']
         logger.info("Dataset loaded and preprocessed.")
 
-    def load_models(self):
-        """
-        Loads the teacher and student models. They start as identical copies.
-        """
-        logger.info(f"Loading teacher and student models from {self.model_name}")
-        self.teacher_model = AutoModelForSequenceClassification.from_pretrained(self.model_name).to(self.device)
-        self.student_model = AutoModelForSequenceClassification.from_pretrained(self.model_name).to(self.device)
-        # Ensure student model is a deep copy
-        self.student_model.load_state_dict(self.teacher_model.state_dict())
-        logger.info("Models loaded.")
+    def load_model(self):
+        logger.info(f"Loading model from {self.model_name}")
+        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name).to(self.device)
+        logger.info("Model loaded.")
 
     def compute_metrics(self, p):
-        """
-        Computes accuracy and F1 score for evaluation.
-        """
         preds = np.argmax(p.predictions, axis=1)
         return self.metrics.compute(predictions=preds, references=p.label_ids)
 
-    def train_model(self, model, output_dir, num_epochs=3):
-        """
-        A generic training function for a given model.
-        This uses the modern TrainingArguments for new versions of the transformers library.
-        """
+    def train_model(self, output_dir, num_epochs=1, callbacks=None):
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=num_epochs,
             per_device_train_batch_size=16,
             per_device_eval_batch_size=16,
-            warmup_steps=500,
+            warmup_steps=10,
             weight_decay=0.01,
             logging_dir=f'./{output_dir}-logs',
-            logging_steps=50,
-            evaluation_strategy="epoch",  # Modern argument
-            save_strategy="epoch",        # Modern argument
+            logging_steps=10,
+            eval_strategy="epoch",
+            save_strategy="epoch",
             load_best_model_at_end=True,
             fp16=True if self.device.type == 'cuda' else False,
         )
         trainer = Trainer(
-            model=model,
+            model=self.model,
             args=training_args,
             train_dataset=self.train_dataset,
             eval_dataset=self.eval_dataset,
             compute_metrics=self.compute_metrics,
+            callbacks=callbacks or []
         )
         trainer.train()
         return trainer
 
-    def compute_gradient_importance(self):
-        """
-        Computes the importance of each weight as the absolute value of its gradient.
-        This requires a forward and backward pass on a batch of data.
-        """
-        logger.info("Computing gradient importance for pruning...")
-        # Select a subset of the training data for gradient calculation
-        data_loader = torch.utils.data.DataLoader(self.train_dataset.select(range(128)), batch_size=8, collate_fn=self.teacher_model.data_collator)
+    def compute_hebbian_importance(self):
+        logger.info("Computing Hebbian importance using activation hooks...")
+        self.activations = {}
+        hooks = []
 
-        importance = {name: torch.zeros_like(param) for name, param in self.student_model.named_parameters() if 'weight' in name and param.requires_grad}
+        def get_activation(name):
+            def hook(model, input, output):
+                self.activations[name] = {'input': input[0].detach(), 'output': output.detach()}
+            return hook
 
-        self.student_model.train()
-        for batch in data_loader:
-            # Move batch to the correct device
-            inputs = {k: v.to(self.device) for k, v in batch.items()}
-
-            outputs = self.student_model(**inputs)
-            loss = outputs.loss
-            loss.backward()
-
-            for name, param in self.student_model.named_parameters():
-                if param.grad is not None and name in importance:
-                    importance[name] += param.grad.abs() # Accumulate absolute gradients
-
-            self.student_model.zero_grad()
-        
-        return importance
-
-    def hebbian_inspired_pruning(self, importance_scores, prune_percent):
-        """
-        Prunes the model based on gradient importance scores.
-        This is a form of magnitude pruning on the gradients, not true Hebbian learning.
-        """
-        logger.info(f"Applying Hebbian-inspired pruning with prune percent: {prune_percent}%...")
-        for name, module in self.student_model.named_modules():
+        for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
-                # We need to apply the mask to the 'weight' parameter of the module
-                param_name = f"{name}.weight"
-                if param_name in importance_scores:
-                    prune.l1_unstructured(module, name='weight', amount=prune_percent / 100.0)
-                    # Make the pruning permanent
-                    prune.remove(module, 'weight')
+                hooks.append(module.register_forward_hook(get_activation(name)))
+
+        data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer)
+        data_loader = torch.utils.data.DataLoader(self.train_dataset, batch_size=8, collate_fn=data_collator)
+        self.model.eval()
+        with torch.no_grad():
+            batch = next(iter(data_loader))
+            inputs = {k: v.to(self.device) for k, v in batch.items()}
+            self.model(**inputs)
+
+        for hook in hooks:
+            hook.remove()
+
+        importance_scores = {}
+        with torch.no_grad():
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Linear) and name in self.activations:
+                    # Aggregate pre-synaptic (input) and post-synaptic (output) activations
+                    input_tensor = self.activations[name]['input']
+                    output_tensor = self.activations[name]['output']
+
+                    if input_tensor.ndim == 3:
+                        pre_activations = input_tensor.mean(dim=[0, 1])
+                    elif input_tensor.ndim == 2:
+                        pre_activations = input_tensor.mean(dim=0)
+                    else:
+                        continue
+
+                    if output_tensor.ndim == 3:
+                        post_activations = output_tensor.mean(dim=[0, 1])
+                    elif output_tensor.ndim == 2:
+                        post_activations = output_tensor.mean(dim=0)
+                    else:
+                        continue
+
+                    # The outer product of post- and pre-synaptic activations
+                    # gives a score matrix with the same shape as the weight matrix.
+                    importance = torch.outer(post_activations.abs(), pre_activations.abs())
+                    importance_scores[f"{name}.weight"] = importance
+
+        return importance_scores
+
+    def prune_model(self, importance_scores, prune_percent):
+        logger.info(f"Applying pruning with prune percent: {prune_percent}%...")
+        masks = {}
+        with torch.no_grad():
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Linear):
+                    param_name = f"{name}.weight"
+                    if param_name in importance_scores:
+                        scores = importance_scores[param_name]
+                        if scores.sum() == 0: continue
+
+                        threshold = torch.quantile(scores.view(-1), prune_percent / 100.0)
+                        mask = (scores > threshold).float().to(self.device)
+                        module.weight.mul_(mask)
+                        masks[param_name] = mask
         logger.info("Pruning applied.")
+        return masks
 
+    def regrow_weights(self, regrowth_percent):
+        logger.info(f"Regrowing {regrowth_percent}% of pruned weights...")
+        with torch.no_grad():
+            for module in self.model.modules():
+                if isinstance(module, nn.Linear):
+                    zero_mask = (module.weight == 0)
+                    num_to_regrow = int((regrowth_percent / 100.0) * zero_mask.sum())
+                    if num_to_regrow > 0:
+                        zero_indices = zero_mask.nonzero(as_tuple=False)
+                        perm = torch.randperm(zero_indices.size(0))
+                        indices_to_regrow = zero_indices[perm[:num_to_regrow]]
+                        new_weights = torch.randn(num_to_regrow, device=self.device) * 0.01
+                        module.weight[indices_to_regrow[:, 0], indices_to_regrow[:, 1]] = new_weights
+        logger.info("Regrowth complete.")
 
-    def distill_knowledge(self, teacher_trainer, num_epochs=2):
-        """
-        Fine-tunes the student model using knowledge distillation.
-        The loss is a combination of the standard cross-entropy loss and a distillation loss.
-        """
-        logger.info("Distilling knowledge from teacher to student...")
-
-        class DistillationTrainer(Trainer):
-            def __init__(self, *args, teacher_model=None, alpha=0.5, temperature=2.0, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.teacher_model = teacher_model
-                self.alpha = alpha
-                self.temperature = temperature
-                self.teacher_model.to(self.device)
-
-            def compute_loss(self, model, inputs, return_outputs=False):
-                # Student's output
-                student_outputs = model(**inputs)
-                student_loss = student_outputs.loss
-
-                # Teacher's output
-                with torch.no_grad():
-                    teacher_outputs = self.teacher_model(**inputs)
-
-                # Distillation loss (KL Divergence)
-                loss_fct = nn.KLDivLoss(reduction="batchmean")
-                distillation_loss = loss_fct(
-                    nn.functional.log_softmax(student_outputs.logits / self.temperature, dim=-1),
-                    nn.functional.softmax(teacher_outputs.logits / self.temperature, dim=-1)
-                ) * (self.temperature ** 2)
-
-                # Combined loss
-                loss = self.alpha * student_loss + (1. - self.alpha) * distillation_loss
-                return (loss, student_outputs) if return_outputs else loss
-
-        training_args = TrainingArguments(
-            output_dir='./results_student_distilled',
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=16,
-            per_device_eval_batch_size=16,
-            logging_steps=50,
-            evaluation_strategy="epoch",  # Modern argument
-            save_strategy="epoch",        # Modern argument
-            load_best_model_at_end=True,
-            fp16=True if self.device.type == 'cuda' else False,
-        )
-
-        distillation_trainer = DistillationTrainer(
-            model=self.student_model,
-            args=training_args,
-            train_dataset=self.train_dataset,
-            eval_dataset=self.eval_dataset,
-            compute_metrics=self.compute_metrics,
-            teacher_model=self.teacher_model,
-        )
-
-        distillation_trainer.train()
-        return distillation_trainer
-
-    def evaluate_model(self, model, trainer):
-        """
-        Evaluates a given model using the provided trainer's evaluation loop.
-        """
+    def evaluate_model(self, trainer):
         logger.info("Evaluating model...")
-        eval_results = trainer.evaluate(eval_dataset=self.eval_dataset)
-        return eval_results
+        return trainer.evaluate(eval_dataset=self.eval_dataset)
 
-    def count_model_parameters(self, model):
-        """
-        Counts the number of trainable and non-zero parameters.
-        """
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        nonzero_params = sum(p.count_nonzero().item() for p in model.parameters())
+    def count_model_parameters(self):
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        nonzero_params = sum(p.count_nonzero().item() for p in self.model.parameters())
         return trainable_params, nonzero_params
 
-    def save_model_for_size_check(self, model, model_name):
-        """
-        Saves the model state dict to a temporary file to check its size on disk.
-        """
-        temp_path = f"{model_name}.bin"
-        torch.save(model.state_dict(), temp_path)
-        size = os.path.getsize(temp_path) / (1024 ** 2)
-        os.remove(temp_path)
-        return size
-
-    def plot_results(self, baseline_metrics, pruned_metrics, baseline_params, pruned_params, baseline_size, pruned_size):
-        """
-        Generates and displays plots comparing the baseline and pruned models.
-        """
-        logger.info("Plotting results...")
-        metrics_labels = ['Accuracy', 'F1 Score']
-        baseline_scores = [baseline_metrics.get('eval_accuracy', 0), baseline_metrics.get('eval_f1', 0)]
-        pruned_scores = [pruned_metrics.get('eval_accuracy', 0), pruned_metrics.get('eval_f1', 0)]
-
-        x = np.arange(len(metrics_labels))
-        width = 0.35
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
-
-        # --- Metrics Plot ---
-        rects1 = ax1.bar(x - width/2, baseline_scores, width, label='Baseline (Teacher)')
-        rects2 = ax1.bar(x + width/2, pruned_scores, width, label='Pruned (Student)')
-
-        ax1.set_ylabel('Scores')
-        ax1.set_title('Performance: Baseline vs. Pruned Model')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(metrics_labels)
-        ax1.legend()
-        ax1.bar_label(rects1, padding=3, fmt='%.3f')
-        ax1.bar_label(rects2, padding=3, fmt='%.3f')
-        ax1.set_ylim(0, 1)
-
-        # --- Compression Plot ---
-        comp_labels = ['Parameters (Non-Zero)', 'Model Size (MB)']
-        baseline_values = [baseline_params[1], baseline_size]
-        pruned_values = [pruned_params[1], pruned_size]
-        x_comp = np.arange(len(comp_labels))
-
-        rects3 = ax2.bar(x_comp - width/2, baseline_values, width, label='Baseline (Teacher)')
-        rects4 = ax2.bar(x_comp + width/2, pruned_values, width, label='Pruned (Student)')
-
-        ax2.set_ylabel('Count')
-        ax2.set_title('Compression: Parameters and Size')
-        ax2.set_xticks(x_comp)
-        ax2.set_xticklabels(comp_labels)
-        ax2.legend()
-        ax2.bar_label(rects3, padding=3, fmt='%.2fM', labels=[f'{v/1e6:.2f}M' for v in baseline_values])
-        ax2.bar_label(rects4, padding=3, fmt='%.2fM', labels=[f'{v/1e6:.2f}M' for v in pruned_values])
-        ax2.set_yscale('log')
-
-        fig.tight_layout()
-        plt.savefig("pruning_results.png")
-        logger.info("Results plot saved to pruning_results.png")
-        plt.show()
-
 if __name__ == "__main__":
-    # --- Configuration ---
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true", help="Run in debug mode.")
+    args = parser.parse_args()
+
     MODEL_NAME = 'bert-base-uncased'
     DATASET_NAME = 'glue'
-    DATASET_TASK = 'mrpc' # MRPC is a small dataset, good for quick experiments
+    DATASET_TASK = 'mrpc'
     TEXT_FIELDS = ['sentence1', 'sentence2']
-    PRUNE_PERCENT = 40.0 # Prune 40% of the weights
     DEVICE = "cuda"
 
-    # --- Initialization ---
+    NUM_PRUNING_CYCLES = 5
+    PRUNE_PERCENT_PER_CYCLE = 10.0
+    REGROWTH_PERCENT_PER_CYCLE = 1.0
+    initial_epochs = 1 if args.debug else 3
+    finetune_epochs_per_cycle = 1
+
     pruner = IterativePruner(model_name=MODEL_NAME, device=DEVICE)
-    pruner.load_and_prepare_dataset(DATASET_NAME, DATASET_TASK, TEXT_FIELDS)
-    pruner.load_models()
+    pruner.load_and_prepare_dataset(DATASET_NAME, DATASET_TASK, TEXT_FIELDS, debug_mode=args.debug)
+    pruner.load_model()
 
-    # --- Step 1: Fine-tune the Teacher Model ---
-    logger.info("--- Step 1: Training the baseline teacher model ---")
-    teacher_trainer = pruner.train_model(pruner.teacher_model, output_dir='./results_teacher', num_epochs=3)
-    teacher_metrics = pruner.evaluate_model(pruner.teacher_model, teacher_trainer)
-    logger.info(f"Teacher Model Evaluation Results: {teacher_metrics}")
+    logger.info("--- Step 1: Initial fine-tuning of the model ---")
+    initial_trainer = pruner.train_model(output_dir='./results_initial', num_epochs=initial_epochs)
+    initial_metrics = pruner.evaluate_model(initial_trainer)
+    initial_params = pruner.count_model_parameters()
+    logger.info(f"Initial Model Evaluation: {initial_metrics}")
+    logger.info(f"Initial Parameters (Non-Zero): {initial_params[1]/1e6:.2f}M")
 
-    # --- Step 2: Prune the Student Model ---
-    logger.info("--- Step 2: Pruning the student model ---")
-    # First, fine-tune the student model a little bit to get meaningful gradients
-    student_trainer_pre_prune = pruner.train_model(pruner.student_model, output_dir='./results_student_pre_prune', num_epochs=1)
-    
-    # Compute importance and prune
-    importance = pruner.compute_gradient_importance()
-    pruner.hebbian_inspired_pruning(importance, PRUNE_PERCENT)
+    all_masks = {}
+    training_histories = [initial_trainer.state.log_history]
 
-    # --- Step 3: Fine-tune the Pruned Student with Knowledge Distillation ---
-    logger.info("--- Step 3: Fine-tuning pruned student with knowledge distillation ---")
-    student_trainer_final = pruner.distill_knowledge(teacher_trainer, num_epochs=3)
-    student_metrics = pruner.evaluate_model(pruner.student_model, student_trainer_final)
-    logger.info(f"Final Pruned Student Model Evaluation Results: {student_metrics}")
+    for cycle in range(NUM_PRUNING_CYCLES):
+        logger.info(f"--- Starting Pruning Cycle {cycle + 1}/{NUM_PRUNING_CYCLES} ---")
+        importance = pruner.compute_hebbian_importance()
+        new_masks = pruner.prune_model(importance, PRUNE_PERCENT_PER_CYCLE)
 
-    # --- Step 4: Analysis and Plotting ---
-    logger.info("--- Step 4: Analyzing results ---")
-    # Get model sizes
-    teacher_size = pruner.save_model_for_size_check(pruner.teacher_model, "teacher_model")
-    student_size = pruner.save_model_for_size_check(pruner.student_model, "student_model")
+        for name, mask in new_masks.items():
+            if name not in all_masks:
+                all_masks[name] = mask
+            else:
+                all_masks[name].mul_(mask)
 
-    # Get parameter counts
-    teacher_params = pruner.count_model_parameters(pruner.teacher_model)
-    student_params = pruner.count_model_parameters(pruner.student_model)
+        pruner.regrow_weights(REGROWTH_PERCENT_PER_CYCLE)
 
-    logger.info(f"Baseline Teacher | Total Params: {teacher_params[0]/1e6:.2f}M | Non-Zero Params: {teacher_params[1]/1e6:.2f}M | Size: {teacher_size:.2f} MB")
-    logger.info(f"Pruned Student   | Total Params: {student_params[0]/1e6:.2f}M | Non-Zero Params: {student_params[1]/1e6:.2f}M | Size: {student_size:.2f} MB")
-    
-    reduction_percent = (1 - student_params[1] / teacher_params[1]) * 100
-    logger.info(f"Parameter reduction: {reduction_percent:.2f}%")
+        logger.info(f"--- Fine-tuning after cycle {cycle + 1} ---")
+        pruning_callback = PruningCallback(all_masks)
+        finetune_trainer = pruner.train_model(
+            output_dir=f'./results_cycle_{cycle+1}',
+            num_epochs=finetune_epochs_per_cycle,
+            callbacks=[pruning_callback]
+        )
+        training_histories.append(finetune_trainer.state.log_history)
 
-    # Plot the final comparison
-    pruner.plot_results(
-        teacher_metrics,
-        student_metrics,
-        teacher_params,
-        student_params,
-        teacher_size,
-        student_size
-    )
+        cycle_metrics = pruner.evaluate_model(finetune_trainer)
+        cycle_params = pruner.count_model_parameters()
+        logger.info(f"End of Cycle {cycle+1} Evaluation: {cycle_metrics}")
+        logger.info(f"End of Cycle {cycle+1} Parameters (Non-Zero): {cycle_params[1]/1e6:.2f}M")
+
+    logger.info("--- Final Analysis ---")
+    final_params = pruner.count_model_parameters()
+    logger.info(f"Initial Non-Zero Params: {initial_params[1]/1e6:.2f}M")
+    logger.info(f"Final Non-Zero Params:   {final_params[1]/1e6:.2f}M")
+    reduction_percent = (1 - final_params[1] / initial_params[1]) * 100 if initial_params[1] > 0 else 0
+    logger.info(f"Total parameter reduction: {reduction_percent:.2f}%")
+    logger.info("Experiment Complete.")
+
+    plot_loss_curves(training_histories)
+
